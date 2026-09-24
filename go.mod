@@ -53,4 +53,4 @@ require (
 	maunium.net/go/mauflag v1.0.0 // indirect
 )
 
-replace maunium.net/go/mautrix => github.com/almeidandres/go v0.30.0-panda.2
+replace maunium.net/go/mautrix => github.com/almeidandres/go v0.30.0-panda.3
