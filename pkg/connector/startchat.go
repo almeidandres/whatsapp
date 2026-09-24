@@ -147,9 +147,16 @@ func (wa *WhatsAppClient) makeCreateChatResponse(ctx context.Context, jid, origJ
 	if origJID != jid {
 		redirID = waid.MakeUserID(jid)
 	}
+	info := wa.wrapDMInfo(ctx, jid)
+	conv, err := wa.Main.DB.Conversation.Get(ctx, wa.UserLogin.ID, jid)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get conversation for new portal backfill")
+	} else {
+		wa.applyHistoryInfo(info, conv)
+	}
 	return &bridgev2.CreateChatResponse{
 		PortalKey:      wa.makeWAPortalKey(jid),
-		PortalInfo:     wa.wrapDMInfo(ctx, jid),
+		PortalInfo:     info,
 		DMRedirectedTo: redirID,
 	}
 }

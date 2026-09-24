@@ -293,53 +293,8 @@ func (wa *WhatsAppClient) HandleMatrixMessageRemove(ctx context.Context, msg *br
 	return err
 }
 
-func (wa *WhatsAppClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) (retErr error) {
-	if !receipt.ReadUpTo.After(receipt.LastRead) {
-		return nil
-	}
-	if receipt.LastRead.IsZero() {
-		receipt.LastRead = receipt.ReadUpTo.Add(-5 * time.Second)
-	}
-	portalJID, err := waid.ParsePortalID(receipt.Portal.ID)
-	if err != nil {
-		return fmt.Errorf("failed to parse portal ID: %w", err)
-	}
-	messages, err := receipt.Portal.Bridge.DB.Message.GetMessagesBetweenTimeQuery(ctx, receipt.Portal.PortalKey, receipt.LastRead, receipt.ReadUpTo)
-	if err != nil {
-		return fmt.Errorf("failed to get messages to mark as read: %w", err)
-	} else if len(messages) == 0 {
-		return nil
-	}
-	log := zerolog.Ctx(ctx)
-	log.Trace().
-		Time("last_read", receipt.LastRead).
-		Time("read_up_to", receipt.ReadUpTo).
-		Int("message_count", len(messages)).
-		Msg("Handling read receipt")
-	messagesToRead := make(map[types.JID][]string)
-	for _, msg := range messages {
-		parsed, err := waid.ParseMessageID(msg.ID)
-		if err != nil {
-			continue
-		}
-		if wa.IsOwnJID(parsed.Sender) {
-			continue
-		}
-		var key types.JID
-		// In group chats, group receipts by sender. In DMs, just use blank key (no participant field).
-		if parsed.Sender != parsed.Chat {
-			key = parsed.Sender
-		}
-		messagesToRead[key] = append(messagesToRead[key], parsed.ID)
-	}
-	defer wa.mcTrack(receipt, time.Now(), &retErr)
-	for messageSender, ids := range messagesToRead {
-		err = wa.Client.MarkRead(ctx, ids, receipt.Receipt.Timestamp, portalJID, messageSender)
-		if err != nil {
-			log.Err(err).Strs("ids", ids).Msg("Failed to mark messages as read")
-		}
-	}
-	return err
+func (wa *WhatsAppClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
+	return nil
 }
 
 func (wa *WhatsAppClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping) (retErr error) {
@@ -654,17 +609,8 @@ func (wa *WhatsAppClient) getLastMessageInfo(ctx context.Context, chatJID types.
 	return lastTS, lastKey, nil
 }
 
-func (wa *WhatsAppClient) HandleMarkedUnread(ctx context.Context, msg *bridgev2.MatrixMarkedUnread) (retErr error) {
-	chatJID, err := waid.ParsePortalID(msg.Portal.ID)
-	if err != nil {
-		return err
-	}
-	lastTS, lastKey, err := wa.getLastMessageInfo(ctx, chatJID, msg.Portal.PortalKey)
-	if err != nil {
-		return err
-	}
-	defer wa.mcTrack(msg, time.Now(), &retErr)
-	return wa.Client.SendAppState(ctx, appstate.BuildMarkChatAsRead(chatJID, msg.Content.Unread, lastTS, lastKey))
+func (wa *WhatsAppClient) HandleMarkedUnread(ctx context.Context, msg *bridgev2.MatrixMarkedUnread) error {
+	return nil
 }
 
 func (wa *WhatsAppClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.MatrixDeleteChat) (retErr error) {
