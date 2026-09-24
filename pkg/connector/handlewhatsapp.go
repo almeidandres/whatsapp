@@ -331,7 +331,9 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 	if evt.Info.IsFromMe &&
 		evt.Message.GetProtocolMessage().GetHistorySyncNotification() != nil &&
 		wa.Main.Bridge.Config.Backfill.Enabled {
-		wa.saveWAHistorySyncNotification(ctx, evt.Message.ProtocolMessage.HistorySyncNotification)
+		if !wa.saveWAHistorySyncNotification(ctx, evt.Message.ProtocolMessage.HistorySyncNotification) {
+			return false
+		}
 	}
 	if parsedMessageType == "ignore" || strings.HasPrefix(parsedMessageType, "unknown_protocol_") {
 		return
@@ -372,7 +374,7 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 		return
 	}
 
-	res := wa.UserLogin.QueueRemoteEvent(&WAMessageEvent{
+	message := &WAMessageEvent{
 		MessageInfoWrapper: &MessageInfoWrapper{
 			Info: evt.Info,
 			wa:   wa,
@@ -382,7 +384,16 @@ func (wa *WhatsAppClient) handleWAMessage(ctx context.Context, evt *events.Messa
 
 		parsedMessageType: parsedMessageType,
 		dontRenderEdited:  dontRenderEdited,
-	})
+	}
+	staged, err := wa.stageBootstrapWAMessage(ctx, message)
+	if err != nil {
+		wa.UserLogin.Log.Err(err).Str("message_id", evt.Info.ID).Msg("Failed to stage incoming WhatsApp message")
+		return false
+	}
+	if staged {
+		return true
+	}
+	res := wa.UserLogin.QueueRemoteEvent(message)
 	return res.Success
 }
 
@@ -461,6 +472,19 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	default:
 		return true
 	}
+	staged, err := wa.stageBootstrapWAReceipt(ctx, evt)
+	if err != nil {
+		wa.UserLogin.Log.Err(err).Msg("Failed to stage incoming WhatsApp receipt")
+		return false
+	}
+	if staged {
+		return true
+	}
+	res := wa.UserLogin.QueueRemoteEvent(wa.makeWAReceiptEvent(ctx, evt, evtType))
+	return res.Success
+}
+
+func (wa *WhatsAppClient) makeWAReceiptEvent(ctx context.Context, evt *events.Receipt, evtType bridgev2.RemoteEventType) *simplevent.Receipt {
 	targets := make([]networkid.MessageID, 0, len(evt.MessageIDs))
 	messageSender := wa.GetLID()
 	if !evt.MessageSender.IsEmpty() {
@@ -484,7 +508,7 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	if senderLID.Server == types.DefaultUserServer && !evt.SenderAlt.IsEmpty() {
 		senderLID = evt.SenderAlt
 	}
-	res := wa.UserLogin.QueueRemoteEvent(&simplevent.Receipt{
+	return &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      evtType,
 			PortalKey: wa.makeWAPortalKey(evt.Chat),
@@ -492,8 +516,7 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 			Timestamp: evt.Timestamp,
 		},
 		Targets: targets,
-	})
-	return res.Success
+	}
 }
 
 func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.ChatPresence) {

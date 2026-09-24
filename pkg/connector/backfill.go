@@ -92,11 +92,11 @@ func (wa *WhatsAppClient) historySyncLoop(ctx context.Context) {
 	}
 }
 
-func (wa *WhatsAppClient) saveWAHistorySyncNotification(ctx context.Context, evt *waE2E.HistorySyncNotification) {
+func (wa *WhatsAppClient) saveWAHistorySyncNotification(ctx context.Context, evt *waE2E.HistorySyncNotification) bool {
 	err := wa.Main.DB.HSNotif.Put(ctx, wa.UserLogin.ID, evt)
 	if err != nil {
 		wa.UserLogin.Log.Err(err).Msg("Failed to store history sync notification in queue")
-		return
+		return false
 	}
 	wa.UserLogin.Log.Debug().
 		Stringer("sync_type", evt.GetSyncType()).
@@ -107,6 +107,7 @@ func (wa *WhatsAppClient) saveWAHistorySyncNotification(ctx context.Context, evt
 	case wa.historySyncWakeup <- struct{}{}:
 	default:
 	}
+	return true
 }
 
 func (wa *WhatsAppClient) downloadAndSaveWAHistorySyncData(ctx context.Context, evt *waE2E.HistorySyncNotification, rowid int) (resetTimer bool) {
@@ -127,17 +128,6 @@ func (wa *WhatsAppClient) downloadAndSaveWAHistorySyncData(ctx context.Context, 
 		log.Err(err).Msg("Failed to download history sync")
 		return
 	}
-	if blob.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
-		wa.handleOnDemandHistorySync(ctx, blob)
-		if err = wa.Main.DB.HSNotif.Delete(ctx, rowid); err != nil {
-			log.Err(err).Msg("Failed to delete queued on-demand history sync notification")
-		} else if err = wa.Client.DeleteMedia(ctx, whatsmeow.MediaHistory, evt.GetDirectPath(), evt.GetFileEncSHA256(), evt.GetEncHandle()); err != nil {
-			log.Err(err).Msg("Failed to delete history sync blob from server")
-		} else {
-			log.Debug().Msg("Finished handling on-demand history sync and deleted history sync blob from server")
-		}
-		return
-	}
 	err = wa.Main.DB.DoTxn(ctx, nil, func(ctx context.Context) (innerErr error) {
 		innerErr = wa.handleWAHistorySync(ctx, evt, blob, true)
 		if innerErr != nil {
@@ -152,6 +142,10 @@ func (wa *WhatsAppClient) downloadAndSaveWAHistorySyncData(ctx context.Context, 
 	if err != nil {
 		log.Err(err).Msg("Failed to store history sync notification data")
 	} else {
+		wa.stagePendingBootstrapConversations(ctx, blob)
+		if blob.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND {
+			wa.handleOnDemandHistorySync(ctx, blob)
+		}
 		resetTimer = blob.GetSyncType() == waHistorySync.HistorySync_INITIAL_BOOTSTRAP ||
 			blob.GetSyncType() == waHistorySync.HistorySync_RECENT ||
 			blob.GetSyncType() == waHistorySync.HistorySync_FULL
@@ -256,6 +250,9 @@ func (wa *WhatsAppClient) handleWAHistorySync(
 			// Don't store messages that will just be skipped.
 			msgEvt, err := wa.Client.ParseWebMessage(jid, rawMsg.GetMessage())
 			if err != nil {
+				if stopOnError {
+					return fmt.Errorf("parse history message %s in %s: %w", rawMsg.GetMessage().GetKey().GetID(), jid, err)
+				}
 				log.Warn().Err(err).
 					Int("msg_index", i).
 					Str("msg_id", rawMsg.GetMessage().GetKey().GetID()).
@@ -280,12 +277,18 @@ func (wa *WhatsAppClient) handleWAHistorySync(
 			}
 
 			msgType := getMessageType(msgEvt.Message)
+			if strings.HasPrefix(msgType, "unknown_protocol_") && stopOnError {
+				return fmt.Errorf("unsupported history message %s in %s: %s", msgEvt.Info.ID, jid, msgType)
+			}
 			if msgType == "ignore" || strings.HasPrefix(msgType, "unknown_protocol_") {
 				ignoredTypes++
 				continue
 			}
 			marshaled, err := proto.Marshal(rawMsg)
 			if err != nil {
+				if stopOnError {
+					return fmt.Errorf("encode history message %s in %s: %w", msgEvt.Info.ID, jid, err)
+				}
 				log.Warn().Err(err).
 					Int("msg_index", i).
 					Str("msg_id", msgEvt.Info.ID).
@@ -319,7 +322,7 @@ func (wa *WhatsAppClient) handleWAHistorySync(
 			).
 			Msg("Collected messages to save from history sync conversation")
 
-		if len(messages) > 0 {
+		if len(messages) > 0 || conv.EndOfHistoryTransferType != nil {
 			err = wa.Main.DB.Conversation.Put(ctx, wadb.NewConversation(wa.UserLogin.ID, jid, conv, maxTime))
 			if err != nil {
 				if stopOnError {
@@ -328,6 +331,8 @@ func (wa *WhatsAppClient) handleWAHistorySync(
 				log.Err(err).Msg("Failed to save conversation metadata")
 				continue
 			}
+		}
+		if len(messages) > 0 {
 			err = wa.Main.DB.Message.Put(ctx, wa.UserLogin.ID, jid, messages)
 			if err != nil {
 				if stopOnError {
@@ -404,14 +409,6 @@ func (wa *WhatsAppClient) createPortalsFromHistorySync(ctx context.Context) {
 		if errors.Is(err, whatsmeow.ErrNotInGroup) || errors.Is(err, whatsmeow.ErrGroupNotFound) {
 			log.Debug().Err(err).Stringer("chat_jid", conv.ChatJID).
 				Msg("Skipping creating room because the user is not a participant")
-			//err = wa.Main.DB.Message.DeleteAllInChat(ctx, wa.UserLogin.ID, conv.ChatJID)
-			//if err != nil {
-			//	log.Err(err).Msg("Failed to delete historical messages for portal")
-			//}
-			err = wa.Main.DB.Conversation.Delete(ctx, wa.UserLogin.ID, conv.ChatJID)
-			if err != nil {
-				log.Err(err).Msg("Failed to delete conversation user is not in")
-			}
 			wg.Done()
 			continue
 		} else if errors.Is(err, whatsmeow.ErrIQRateOverLimit) {
@@ -518,13 +515,12 @@ func (wa *WhatsAppClient) FetchMessages(ctx context.Context, params bridgev2.Fet
 	}
 	var hasMore bool
 	if !params.Forward && wa.Main.Config.HistorySync.BackwardsOnDemand {
-		hasMore = conv != nil && ptr.Val(conv.EndOfHistoryTransferType) == waHistorySync.Conversation_COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY
+		hasMore = conv != nil && historyAvailableOnPhone(conv.EndOfHistoryTransferType)
 	}
 	messages, err := wa.Main.DB.Message.GetBetween(ctx, wa.UserLogin.ID, portalJID, startTime, endTime, params.Count+1)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load messages from database: %w", err)
 	} else if len(messages) == 0 || (len(messages) == 1 && anchorID != "" && messages[0].GetKey().GetID() == anchorID) {
-		wa.deleteHistorySyncMessages(ctx, portalJID, 0, 0)
 		if hasMore && !params.AllowSlowFetch {
 			return &bridgev2.FetchMessagesResponse{
 				MoreRequiresSlowFetch: true,
@@ -561,30 +557,14 @@ func (wa *WhatsAppClient) FetchMessages(ctx context.Context, params bridgev2.Fet
 	return resp, nil
 }
 
-func (wa *WhatsAppClient) deleteHistorySyncMessages(ctx context.Context, portalJID types.JID, newestTS, oldestTS uint64) {
-	var err error
-	var rows int64
-	if (newestTS == 0 && oldestTS == 0) || !wa.Main.Bridge.Config.Backfill.Queue.AnyEnabled() {
-		// If the backfill queue isn't enabled, delete all messages after backfilling a batch.
-		rows, err = wa.Main.DB.Message.DeleteAllInChat(ctx, wa.UserLogin.ID, portalJID)
-	} else {
-		// Otherwise just delete the messages that got backfilled
-		rows, err = wa.Main.DB.Message.DeleteBetween(ctx, wa.UserLogin.ID, portalJID, newestTS, oldestTS)
+// historyAvailableOnPhone reports whether WhatsApp permits another history request.
+// Type 3 has more messages, but the primary denies access to them.
+func historyAvailableOnPhone(end *waHistorySync.Conversation_EndOfHistoryTransferType) bool {
+	if end == nil {
+		return false
 	}
-	if err != nil {
-		zerolog.Ctx(ctx).Warn().Err(err).
-			Stringer("portal_jid", portalJID).
-			Uint64("newest_ts", newestTS).
-			Uint64("oldest_ts", oldestTS).
-			Msg("Failed to delete messages from database after backfill")
-	} else {
-		zerolog.Ctx(ctx).Debug().
-			Stringer("portal_jid", portalJID).
-			Uint64("newest_ts", newestTS).
-			Uint64("oldest_ts", oldestTS).
-			Int64("rows_affected", rows).
-			Msg("Deleted history sync messages from database")
-	}
+	return *end == waHistorySync.Conversation_COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY ||
+		*end == waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_BUT_MORE_MSG_REMAIN_ON_PRIMARY
 }
 
 func (wa *WhatsAppClient) convertHistorySyncMessages(
@@ -595,7 +575,6 @@ func (wa *WhatsAppClient) convertHistorySyncMessages(
 	explodeOnError bool,
 ) (*bridgev2.FetchMessagesResponse, error) {
 	oldestTS := messages[len(messages)-1].GetMessageTimestamp()
-	newestTS := messages[0].GetMessageTimestamp()
 	convertedMessages := make([]*bridgev2.BackfillMessage, 0, len(messages))
 	var mediaRequests []*wadb.MediaRequest
 	dups := make(exmaps.Set[networkid.MessageID])
@@ -644,9 +623,7 @@ func (wa *WhatsAppClient) convertHistorySyncMessages(
 		Messages: convertedMessages,
 		Cursor:   networkid.PaginationCursor(strconv.FormatUint(oldestTS, 10)),
 		CompleteCallback: func() {
-			// TODO this only deletes after backfilling. If there's no need for backfill after a relogin,
-			//      the messages will be stuck in the database
-			wa.deleteHistorySyncMessages(ctx, portalJID, newestTS, oldestTS)
+			// ponytail: retain cached messages until durable delivery checkpoints allow safe pruning.
 			if len(mediaRequests) > 0 {
 				go func(ctx context.Context) {
 					for _, req := range mediaRequests {
@@ -673,8 +650,7 @@ func (wa *WhatsAppClient) fetchMessagesFromPhone(ctx context.Context, portalJID 
 		return nil, fmt.Errorf("failed to parse anchor message ID: %w", err)
 	}
 
-	msgID := wa.Client.GenerateMessageID()
-	reqData := wa.Client.BuildHistorySyncRequest(&types.MessageInfo{
+	anchor := &types.MessageInfo{
 		MessageSource: types.MessageSource{
 			Chat:     portalJID,
 			Sender:   parsed.Sender,
@@ -683,24 +659,34 @@ func (wa *WhatsAppClient) fetchMessagesFromPhone(ctx context.Context, portalJID 
 		},
 		ID:        parsed.ID,
 		Timestamp: params.AnchorMessage.Timestamp,
-	}, 50)
+	}
+	if err := wa.RequestHistoryFromPhone(ctx, anchor); err != nil {
+		return nil, err
+	}
+	return &bridgev2.FetchMessagesResponse{HasMore: true, Pending: true}, nil
+}
+
+// RequestHistoryFromPhone requests older messages using a raw WhatsApp anchor.
+// It does not require a Matrix portal or create a room.
+func (wa *WhatsAppClient) RequestHistoryFromPhone(ctx context.Context, anchor *types.MessageInfo) error {
+	if anchor == nil || anchor.Chat.IsEmpty() || anchor.ID == "" {
+		return fmt.Errorf("chat and message ID are required to request phone history")
+	}
+	msgID := wa.Client.GenerateMessageID()
+	reqData := wa.Client.BuildHistorySyncRequest(anchor, 50)
 	zerolog.Ctx(ctx).Debug().
 		Str("request_msg_id", msgID).
-		Stringer("portal_jid", portalJID).
-		Any("anchor_msg_parsed", parsed).
+		Stringer("chat_jid", anchor.Chat).
 		Any("request_data", reqData).
 		Msg("Sending history sync request")
-	_, err = wa.Client.SendMessage(ctx, wa.JID.ToNonAD(), reqData, whatsmeow.SendRequestExtra{
+	_, err := wa.Client.SendMessage(ctx, wa.JID.ToNonAD(), reqData, whatsmeow.SendRequestExtra{
 		ID:   msgID,
 		Peer: true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to send history sync request: %w", err)
+		return fmt.Errorf("failed to send history sync request: %w", err)
 	}
-	return &bridgev2.FetchMessagesResponse{
-		HasMore: true,
-		Pending: true,
-	}, nil
+	return nil
 }
 
 func (wa *WhatsAppClient) handleOnDemandHistorySync(ctx context.Context, blob *waHistorySync.HistorySync) {
@@ -729,7 +715,17 @@ func (wa *WhatsAppClient) handleOnDemandHistorySync(ctx context.Context, blob *w
 				portalJID = lid
 			}
 		}
-		portal, err := wa.Main.Bridge.GetPortalByKey(ctx, wa.makeWAPortalKey(portalJID))
+		key := wa.makeWAPortalKey(portalJID)
+		job, err := wa.Main.Bridge.DB.GetBootstrapJob(ctx, wa.UserLogin.ID, key)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Stringer("portal_jid", portalJID).Msg("Failed to inspect selected portal before on-demand backfill")
+			continue
+		}
+		if job != nil && job.Status != "ready" {
+			// The selected portal's cached history was staged above; importing it here would bypass the gate.
+			continue
+		}
+		portal, err := wa.Main.Bridge.GetPortalByKey(ctx, key)
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).Stringer("portal_jid", portalJID).Msg("Failed to get portal for on-demand history sync")
 			continue
@@ -760,7 +756,7 @@ func (wa *WhatsAppClient) handleOnDemandHistorySync(ctx context.Context, blob *w
 				if err != nil {
 					return nil, err
 				}
-				resp.HasMore = conv.GetEndOfHistoryTransferType() == waHistorySync.Conversation_COMPLETE_BUT_MORE_MESSAGES_REMAIN_ON_PRIMARY
+				resp.HasMore = historyAvailableOnPhone(conv.EndOfHistoryTransferType)
 				return resp, nil
 			},
 		})

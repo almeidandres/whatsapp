@@ -2,6 +2,7 @@ package wadb
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -114,6 +115,65 @@ func (mq *MessageQuery) GetBetween(ctx context.Context, loginID networkid.UserLo
 	return webMessageInfoConverter.
 		NewRowIter(mq.Query(ctx, query, args...)).
 		AsList()
+}
+
+// BootstrapPage scans cached history newest-to-oldest without skipping messages that share a timestamp.
+func (mq *MessageQuery) BootstrapPage(ctx context.Context, loginID networkid.UserLoginID, chatJID types.JID, cursor string, limit int) ([]*waWeb.WebMessageInfo, string, bool, error) {
+	if limit < 1 {
+		return nil, "", false, fmt.Errorf("bootstrap page size must be positive")
+	}
+	query := `SELECT timestamp, sender_jid, message_id, data FROM whatsapp_history_sync_message
+		WHERE bridge_id=$1 AND user_login_id=$2 AND chat_jid=$3`
+	args := []any{mq.BridgeID, loginID, chatJID}
+	if cursor != "" {
+		var last struct {
+			Timestamp int64  `json:"t"`
+			Sender    string `json:"s"`
+			MessageID string `json:"i"`
+		}
+		if err := json.Unmarshal([]byte(cursor), &last); err != nil || last.Sender == "" || last.MessageID == "" {
+			return nil, "", false, fmt.Errorf("invalid WhatsApp bootstrap cursor: %v", err)
+		}
+		query += ` AND (timestamp, sender_jid, message_id) < ($4, $5, $6)`
+		args = append(args, last.Timestamp, last.Sender, last.MessageID)
+	}
+	query += fmt.Sprintf(` ORDER BY timestamp DESC, sender_jid DESC, message_id DESC LIMIT $%d`, len(args)+1)
+	args = append(args, limit+1)
+	rows, err := mq.Query(ctx, query, args...)
+	if err != nil {
+		return nil, "", false, err
+	}
+	defer rows.Close()
+	messages := make([]*waWeb.WebMessageInfo, 0, limit)
+	var next string
+	for rows.Next() {
+		var last struct {
+			Timestamp int64  `json:"t"`
+			Sender    string `json:"s"`
+			MessageID string `json:"i"`
+		}
+		var data []byte
+		if err = rows.Scan(&last.Timestamp, &last.Sender, &last.MessageID, &data); err != nil {
+			return nil, "", false, err
+		}
+		if len(messages) == limit {
+			return messages, next, true, rows.Err()
+		}
+		var stored waHistorySync.HistorySyncMsg
+		if err = proto.Unmarshal(data, &stored); err != nil {
+			return nil, "", false, fmt.Errorf("decode WhatsApp cached history: %w", err)
+		}
+		if stored.GetMessage() == nil {
+			return nil, "", false, fmt.Errorf("WhatsApp cached history has no message")
+		}
+		encoded, err := json.Marshal(last)
+		if err != nil {
+			return nil, "", false, err
+		}
+		next = string(encoded)
+		messages = append(messages, stored.GetMessage())
+	}
+	return messages, next, false, rows.Err()
 }
 
 func (mq *MessageQuery) DeleteBetween(ctx context.Context, loginID networkid.UserLoginID, chatJID types.JID, before, after uint64) (int64, error) {
