@@ -8,13 +8,70 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
+	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/id"
+	"time"
 )
+
+func TestBootstrapMediaRequestWaitsForMessageMapping(t *testing.T) {
+	ctx := context.Background()
+	raw, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "media.db")+"?_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	core := database.New("wa", database.MetaTypes{}, raw)
+	if err = core.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wa := New("wa", raw, zerolog.Nop())
+	if err = wa.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = raw.Exec(ctx, `INSERT INTO "user"(bridge_id,mxid) VALUES ($1,$2)`, "wa", "@owner:localhost"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = raw.Exec(ctx, `INSERT INTO user_login(bridge_id,user_mxid,id,remote_name,metadata) VALUES ($1,$2,$3,$4,$5)`, "wa", "@owner:localhost", "login", "phone", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	key := networkid.PortalKey{ID: "thread", Receiver: "login"}
+	if err = core.Portal.Insert(ctx, &database.Portal{PortalKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	req := &MediaRequest{UserLoginID: "login", MessageID: "media", PortalKey: key, MediaKey: []byte("key"), Status: MediaBackfillRequestStatusNotRequested}
+	if _, err = wa.MediaRequest.PutBootstrapRequest(ctx, req); err == nil {
+		t.Fatal("media request saved before Matrix message mapping")
+	}
+	if err = core.Ghost.Insert(ctx, &database.Ghost{ID: "sender"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = core.Message.Insert(ctx, &database.Message{Room: key, ID: "media", MXID: "$event", SenderID: "sender", SenderMXID: id.UserID("@sender:localhost"), Timestamp: time.UnixMilli(2)}); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := wa.MediaRequest.PutBootstrapRequest(ctx, req)
+	if err != nil || !inserted {
+		t.Fatalf("media request not saved after mapping: %t %v", inserted, err)
+	}
+	if err = wa.MediaRequest.Put(ctx, &MediaRequest{UserLoginID: "login", MessageID: "media", PortalKey: key, Status: MediaBackfillRequestStatusRequested}); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err = wa.MediaRequest.PutBootstrapRequest(ctx, req)
+	if err != nil || inserted {
+		t.Fatalf("retry reset existing media request: %t %v", inserted, err)
+	}
+	requests, err := wa.MediaRequest.GetUnrequestedForUserLogin(ctx, "login")
+	if err != nil || len(requests) != 0 {
+		t.Fatalf("retry reset a requested media item: %+v %v", requests, err)
+	}
+}
 
 func TestBootstrapPageKeepsSameTimestampMessages(t *testing.T) {
 	ctx := context.Background()

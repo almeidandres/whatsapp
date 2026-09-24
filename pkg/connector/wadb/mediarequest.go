@@ -51,6 +51,21 @@ const (
 	`
 )
 
+// PutBootstrapRequest preserves an existing media-request status across an
+// interrupted history-import retry. The message mapping must exist first.
+func (mrq *MediaRequestQuery) PutBootstrapRequest(ctx context.Context, mr *MediaRequest) (bool, error) {
+	mr.BridgeID = mrq.BridgeID
+	result, err := mrq.GetDB().Exec(ctx, `INSERT INTO whatsapp_media_backfill_request (
+		bridge_id, user_login_id, message_id, portal_id, portal_receiver, media_key, status, error
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+	ON CONFLICT (bridge_id, user_login_id, message_id) DO NOTHING`, mr.sqlVariables()...)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count == 1, err
+}
+
 func (mrq *MediaRequestQuery) Put(ctx context.Context, mr *MediaRequest) error {
 	mr.BridgeID = mrq.BridgeID
 	return mrq.Exec(ctx, upsertMediaRequestQuery, mr.sqlVariables()...)

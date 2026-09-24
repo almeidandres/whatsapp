@@ -316,8 +316,16 @@ func (wa *WhatsAppClient) ConvertBootstrapHistory(ctx context.Context, portal *b
 	isViewOnce := evt.IsViewOnce || evt.IsViewOnceV2 || evt.IsViewOnceV2Extension
 	converted, mediaReq := wa.convertHistorySyncMessage(ctx, portal, &evt.Info, evt.Message, evt.RawMessage, isViewOnce, msg.Reactions)
 	if mediaReq != nil {
-		if err = wa.Main.DB.MediaRequest.Put(ctx, mediaReq); err != nil {
-			return nil, fmt.Errorf("persist WhatsApp media request: %w", err)
+		converted.AfterBootstrapImport = func(ctx context.Context) error {
+			inserted, err := wa.Main.DB.MediaRequest.PutBootstrapRequest(ctx, mediaReq)
+			if err != nil {
+				return fmt.Errorf("persist WhatsApp media request: %w", err)
+			}
+			if inserted && wa.Main.Config.HistorySync.MediaRequests.AutoRequestMedia &&
+				wa.Main.Config.HistorySync.MediaRequests.RequestMethod == MediaRequestMethodImmediate {
+				go wa.sendMediaRequest(context.WithoutCancel(ctx), mediaReq)
+			}
+			return nil
 		}
 	}
 	return converted, nil
