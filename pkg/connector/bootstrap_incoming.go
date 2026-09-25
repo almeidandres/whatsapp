@@ -88,17 +88,14 @@ func (wa *WhatsAppClient) stageBootstrapWAMessage(ctx context.Context, evt *WAMe
 	if err != nil {
 		return false, err
 	}
-	resume := portal == nil
-	if portal != nil {
-		job, err := wa.Main.Bridge.DB.GetBootstrapJob(ctx, wa.UserLogin.ID, key)
-		if err != nil {
-			return false, err
-		}
-		if portal.MXID != "" && (job == nil || job.Status == "ready") {
-			return false, nil
-		}
-		resume = job == nil || portal.MXID != ""
+	job, err := wa.Main.Bridge.DB.GetBootstrapJob(ctx, wa.UserLogin.ID, key)
+	if err != nil {
+		return false, err
 	}
+	if job == nil || (portal != nil && portal.MXID != "" && job.Status == "ready") {
+		return false, nil
+	}
+	resume := portal == nil || portal.MXID != ""
 	payload, err := encodeStagedWAMessage(evt)
 	if err != nil {
 		return false, err

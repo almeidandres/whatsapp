@@ -49,6 +49,33 @@ func TestStagedWhatsAppMessageRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUnselectedIncomingWhatsAppMessageUsesLiveDelivery(t *testing.T) {
+	ctx := context.Background()
+	raw, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "live.db")+"?_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	db := database.New("wa", database.MetaTypes{}, raw)
+	if err = db.Upgrade(ctx); err != nil {
+		t.Fatal(err)
+	}
+	bridge := &bridgev2.Bridge{DB: db, Config: &bridgeconfig.BridgeConfig{}}
+	wa := &WhatsAppClient{Main: &WhatsAppConnector{Bridge: bridge}, UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "login"}}}
+	chat := types.NewJID("123", types.GroupServer)
+	evt := &WAMessageEvent{MessageInfoWrapper: &MessageInfoWrapper{wa: wa, Info: types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: chat, Sender: chat}, ID: "new-message", Timestamp: time.Unix(42, 0),
+	}}}
+	staged, err := wa.stageBootstrapWAMessage(ctx, evt)
+	if err != nil || staged {
+		t.Fatalf("new message did not take live delivery path: staged=%t err=%v", staged, err)
+	}
+	job, err := db.GetBootstrapJob(ctx, wa.UserLogin.ID, evt.GetPortalKey())
+	if err != nil || job != nil {
+		t.Fatalf("new message unexpectedly selected history bootstrap: %+v %v", job, err)
+	}
+}
+
 func TestReceiptStagedBeforeFirstPortalRecord(t *testing.T) {
 	ctx := context.Background()
 	raw, err := dbutil.NewWithDialect("file:"+filepath.Join(t.TempDir(), "incoming.db")+"?_foreign_keys=on", "sqlite3")
